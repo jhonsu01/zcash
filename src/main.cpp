@@ -2492,7 +2492,6 @@ void static UpdateTip(CBlockIndex *pindexNew) {
 bool static DisconnectTip(CValidationState &state, bool fBare = false) {
     CBlockIndex *pindexDelete = chainActive.Tip();
     assert(pindexDelete);
-    mempool.check(pcoinsTip);
     // Read block from disk.
     CBlock block;
     if (!ReadBlockFromDisk(block, pindexDelete))
@@ -2527,7 +2526,6 @@ bool static DisconnectTip(CValidationState &state, bool fBare = false) {
             mempool.removeWithAnchor(anchorBeforeDisconnect);
         }
         mempool.removeCoinbaseSpends(pcoinsTip, pindexDelete->nHeight);
-        mempool.check(pcoinsTip);
     }
 
     // Update chainActive and related variables.
@@ -2557,7 +2555,6 @@ static int64_t nTimePostConnect = 0;
  */
 bool static ConnectTip(CValidationState &state, CBlockIndex *pindexNew, CBlock *pblock) {
     assert(pindexNew->pprev == chainActive.Tip());
-    mempool.check(pcoinsTip);
     // Read block from disk.
     int64_t nTime1 = GetTimeMicros();
     CBlock block;
@@ -2597,7 +2594,6 @@ bool static ConnectTip(CValidationState &state, CBlockIndex *pindexNew, CBlock *
     // Remove conflicting transactions from the mempool.
     list<CTransaction> txConflicted;
     mempool.removeForBlock(pblock->vtx, pindexNew->nHeight, txConflicted, !IsInitialBlockDownload());
-    mempool.check(pcoinsTip);
     // Update chainActive & related variables.
     UpdateTip(pindexNew);
     // Tell wallet about transactions that went from mempool
@@ -2748,6 +2744,7 @@ static bool ActivateBestChainStep(CValidationState &state, CBlockIndex *pindexMo
         }
     }
     }
+    mempool.check(pcoinsTip);
 
     // Callbacks/notifications for a new best chain.
     if (fInvalidFound)
