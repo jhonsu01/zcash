@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <gtest/gtest-spi.h>
 
+#include "consensus/upgrades.h"
 #include "consensus/validation.h"
 #include "core_io.h"
 #include "main.h"
@@ -92,6 +93,8 @@ TEST(Mempool, PriorityStatsDoNotCrash) {
 }
 
 TEST(Mempool, TxInputLimit) {
+    SelectParams(CBaseChainParams::TESTNET);
+
     CTxMemPool pool(::minRelayTxFee);
     bool missingInputs;
 
@@ -136,3 +139,36 @@ TEST(Mempool, TxInputLimit) {
     EXPECT_EQ(state4.GetRejectReason(), "bad-txns-version-too-low");
 }
 
+// Valid overwinter v3 format tx gets rejected because overwinter hasn't activated yet.
+// Note: This test will fail if Overwinter is ever set to ALWAYS_ACTIVE on testnet.
+TEST(Mempool, OverwinterNotActiveYet) {
+    SelectParams(CBaseChainParams::TESTNET);
+
+    CTxMemPool pool(::minRelayTxFee);
+    bool missingInputs;
+    CMutableTransaction mtx;
+    mtx.fOverwintered = true;
+    mtx.nVersion = 3;
+    mtx.nVersionGroupId = OVERWINTER_VERSION_GROUP_ID;
+    mtx.nExpiryHeight = 0;
+    CValidationState state1;
+    CTransaction tx1(mtx);
+    EXPECT_FALSE(AcceptToMemoryPool(pool, state1, tx1, false, &missingInputs));
+    EXPECT_EQ(state1.GetRejectReason(), "tx-overwinter-not-active-yet");
+}
+
+// Sprout tx version 3 gets past overwinter format checks present in CheckTransactionWithoutProofVerification
+TEST(Mempool, V3TxButNotOverwinter) {
+    SelectParams(CBaseChainParams::TESTNET);
+
+    CTxMemPool pool(::minRelayTxFee);
+    bool missingInputs;
+    CMutableTransaction mtx;
+    mtx.fOverwintered = false;
+    mtx.nVersion = 3;
+    CValidationState state1;
+    CTransaction tx1(mtx);
+
+    EXPECT_FALSE(AcceptToMemoryPool(pool, state1, tx1, false, &missingInputs));
+    EXPECT_EQ(state1.GetRejectReason(), "bad-txns-vin-empty");
+}

@@ -30,7 +30,7 @@ TEST(CheckBlock, VersionTooLow) {
 
     MockCValidationState state;
     EXPECT_CALL(state, DoS(100, false, REJECT_INVALID, "version-too-low", false)).Times(1);
-    EXPECT_FALSE(CheckBlock(block, state, verifier, false, false));
+    EXPECT_FALSE(CheckBlock(block, state, verifier, SPROUT_BRANCH_ID, false, false));
 }
 
 TEST(ContextualCheckBlock, BadCoinbaseHeight) {
@@ -74,4 +74,31 @@ TEST(ContextualCheckBlock, BadCoinbaseHeight) {
     CTransaction tx4 {mtx};
     block.vtx[0] = tx4;
     EXPECT_TRUE(ContextualCheckBlock(block, state, &indexPrev));
+}
+
+// Test to make sure that a block evaluated under Sprout rules cannot include an Overwinter tx.
+TEST(ContextualCheckBlock, BlockSproutRulesOverwinterTx) {
+    SelectParams(CBaseChainParams::MAIN);
+
+    CMutableTransaction mtx;
+    mtx.vin.resize(1);
+    mtx.vin[0].prevout.SetNull();
+    mtx.vin[0].scriptSig = CScript() << 1 << OP_0;
+    mtx.vout.resize(1);
+    mtx.vout[0].scriptPubKey = CScript() << OP_TRUE;
+    mtx.vout[0].nValue = 0;
+
+    mtx.fOverwintered = true;
+    mtx.nVersion = 3;
+    mtx.nVersionGroupId = OVERWINTER_VERSION_GROUP_ID;
+
+    CTransaction tx {mtx};
+    CBlock block;
+    block.vtx.push_back(tx);
+
+    MockCValidationState state;
+    CBlockIndex indexPrev {block};
+
+    EXPECT_CALL(state, DoS(100, false, REJECT_INVALID, "cb-no-overwinter-tx-when-inactive", false)).Times(1);
+    EXPECT_FALSE(ContextualCheckBlock(block, state, &indexPrev));
 }
