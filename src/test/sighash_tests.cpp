@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include "consensus/upgrades.h"
 #include "consensus/validation.h"
 #include "data/sighash.json.h"
 #include "main.h"
@@ -92,7 +93,7 @@ void static RandomScript(CScript &script) {
         script << oplist[insecure_rand() % (sizeof(oplist)/sizeof(oplist[0]))];
 }
 
-void static RandomTransaction(CMutableTransaction &tx, bool fSingle) {
+void static RandomTransaction(CMutableTransaction &tx, bool fSingle, uint32_t consensusBranchId) {
     tx.nVersion = insecure_rand();
     tx.vin.clear();
     tx.vout.clear();
@@ -143,7 +144,7 @@ void static RandomTransaction(CMutableTransaction &tx, bool fSingle) {
         // Empty output script.
         CScript scriptCode;
         CTransaction signTx(tx);
-        uint256 dataToBeSigned = SignatureHash(scriptCode, signTx, NOT_AN_INPUT, SIGHASH_ALL);
+        uint256 dataToBeSigned = SignatureHash(scriptCode, signTx, NOT_AN_INPUT, SIGHASH_ALL, 0, consensusBranchId);
 
         assert(crypto_sign_detached(&tx.joinSplitSig[0], NULL,
                                     dataToBeSigned.begin(), 32,
@@ -156,6 +157,7 @@ BOOST_FIXTURE_TEST_SUITE(sighash_tests, BasicTestingSetup)
 
 BOOST_AUTO_TEST_CASE(sighash_test)
 {
+    uint32_t consensusBranchId = NetworkUpgradeInfo[Consensus::BASE_SPROUT].nBranchId;
     seed_insecure_rand(false);
 
     #if defined(PRINT_SIGHASH_JSON)
@@ -170,14 +172,14 @@ BOOST_AUTO_TEST_CASE(sighash_test)
     for (int i=0; i<nRandomTests; i++) {
         int nHashType = insecure_rand();
         CMutableTransaction txTo;
-        RandomTransaction(txTo, (nHashType & 0x1f) == SIGHASH_SINGLE);
+        RandomTransaction(txTo, (nHashType & 0x1f) == SIGHASH_SINGLE, consensusBranchId);
         CScript scriptCode;
         RandomScript(scriptCode);
         int nIn = insecure_rand() % txTo.vin.size();
 
         uint256 sh, sho;
         sho = SignatureHashOld(scriptCode, txTo, nIn, nHashType);
-        sh = SignatureHash(scriptCode, txTo, nIn, nHashType);
+        sh = SignatureHash(scriptCode, txTo, nIn, nHashType, 0, consensusBranchId);
         #if defined(PRINT_SIGHASH_JSON)
         CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
         ss << txTo;
@@ -203,6 +205,7 @@ BOOST_AUTO_TEST_CASE(sighash_test)
 // Goal: check that SignatureHash generates correct hash
 BOOST_AUTO_TEST_CASE(sighash_from_data)
 {
+    uint32_t consensusBranchId = NetworkUpgradeInfo[Consensus::BASE_SPROUT].nBranchId;
     UniValue tests = read_json(std::string(json_tests::sighash, json_tests::sighash + sizeof(json_tests::sighash)));
 
     for (size_t idx = 0; idx < tests.size(); idx++) {
@@ -250,7 +253,7 @@ BOOST_AUTO_TEST_CASE(sighash_from_data)
           continue;
         }
 
-        sh = SignatureHash(scriptCode, tx, nIn, nHashType);
+        sh = SignatureHash(scriptCode, tx, nIn, nHashType, 0, consensusBranchId);
         BOOST_CHECK_MESSAGE(sh.GetHex() == sigHashHex, strTest);
     }
 }

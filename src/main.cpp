@@ -646,11 +646,19 @@ unsigned int LimitOrphanTxSize(unsigned int nMaxOrphans) EXCLUSIVE_LOCKS_REQUIRE
 
 
 
-bool IsStandardTx(const CTransaction& tx, string& reason)
+bool IsStandardTx(const CTransaction& tx, string& reason, uint32_t consensusBranchId)
 {
-    if (tx.nVersion > CTransaction::MAX_CURRENT_VERSION || tx.nVersion < CTransaction::MIN_CURRENT_VERSION) {
-        reason = "version";
-        return false;
+    if (consensusBranchId == NetworkUpgradeInfo[Consensus::UPGRADE_OVERWINTER].nBranchId ) {
+        if (tx.nVersion > CTransaction::OVERWINTER_MAX_CURRENT_VERSION || tx.nVersion < CTransaction::OVERWINTER_MIN_CURRENT_VERSION) {
+            reason = "invalid-overwinter-version";
+            return false;
+        }
+    } else {
+        // Pre-Overwinter version check
+        if (tx.nVersion > CTransaction::MAX_CURRENT_VERSION || tx.nVersion < CTransaction::MIN_CURRENT_VERSION) {
+            reason = "version";
+            return false;
+        }
     }
 
     BOOST_FOREACH(const CTxIn& txin, tx.vin)
@@ -752,7 +760,7 @@ bool CheckFinalTx(const CTransaction &tx, int flags)
  * 2. P2SH scripts with a crazy number of expensive
  *    CHECKSIG/CHECKMULTISIG operations
  */
-bool AreInputsStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
+bool AreInputsStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs, uint32_t consensusBranchId)
 {
     if (tx.IsCoinBase())
         return true; // Coinbases don't use vin normally
@@ -778,7 +786,7 @@ bool AreInputsStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
         // IsStandardTx() will have already returned false
         // and this method isn't called.
         vector<vector<unsigned char> > stack;
-        if (!EvalScript(stack, tx.vin[i].scriptSig, SCRIPT_VERIFY_NONE, BaseSignatureChecker()))
+        if (!EvalScript(stack, tx.vin[i].scriptSig, SCRIPT_VERIFY_NONE, BaseSignatureChecker(), consensusBranchId))
             return false;
 
         if (whichType == TX_SCRIPTHASH)
@@ -841,14 +849,14 @@ unsigned int GetP2SHSigOpCount(const CTransaction& tx, const CCoinsViewCache& in
 }
 
 bool CheckTransaction(const CTransaction& tx, CValidationState &state,
-                      libzcash::ProofVerifier& verifier)
+                      libzcash::ProofVerifier& verifier, uint32_t consensusBranchId)
 {
     // Don't count coinbase transactions because mining skews the count
     if (!tx.IsCoinBase()) {
         transactionsValidated.increment();
     }
 
-    if (!CheckTransactionWithoutProofVerification(tx, state)) {
+    if (!CheckTransactionWithoutProofVerification(tx, state, consensusBranchId)) {
         return false;
     } else {
         // Ensure that zk-SNARKs verify
@@ -862,14 +870,48 @@ bool CheckTransaction(const CTransaction& tx, CValidationState &state,
     }
 }
 
-bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidationState &state)
+bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidationState &state, uint32_t consensusBranchId)
 {
     // Basic checks that don't depend on any context
 
-    // Check transaction version
-    if (tx.nVersion < MIN_TX_VERSION) {
+    // Check min and max tx version of pre-Overwinter and Overwinter transactions.  Range allows for soft fork.
+    if (tx.fOverwintered) {
+        if (tx.nVersion < CTransaction::OVERWINTER_MIN_CURRENT_VERSION) {
+            return state.DoS(100, error("CheckTransaction(): overwinter version too low"),
+                REJECT_INVALID, "bad-tx-overwinter-version-too-low");
+        }
+        // We may want to have different rejection scores
+        else if (tx.nVersion > CTransaction::OVERWINTER_MAX_CURRENT_VERSION ) {
+            return state.DoS(100, error("CheckTransaction(): overwinter version too high"),
+                REJECT_INVALID, "bad-tx-overwinter-version-too-high");
+        }
+    }
+    else if (tx.nVersion < MIN_TX_VERSION) {
         return state.DoS(100, error("CheckTransaction(): version too low"),
                          REJECT_INVALID, "bad-txns-version-too-low");
+    }
+
+    // When checking the transaction against the consensus rules for the Overwinter branch, any transaction
+    // with version format >= 3 must have the fOverwintered flag set.
+    // With Sprout consensus rules, where the branch id is 0, we do not need to perform this check as the
+    // Sprout epoch allows for transactions with version number >= 3 (without setting fOverwintered flag).
+    if (NetworkUpgradeInfo[Consensus::UPGRADE_OVERWINTER].nBranchId == consensusBranchId) {
+        if (!tx.fOverwintered && tx.nVersion >= 3) {
+            return state.DoS(100, error("CheckTransaction(): version requires overwinter flag to be set"),
+                REJECT_INVALID, "overwinter-flag-not-set");
+        }
+    }
+
+    // Check Overwintered tx version group id matches what Zcash has assigned to v3 tx format version.
+    if (tx.fOverwintered && tx.nVersion == 3 && tx.nVersionGroupId != OVERWINTER_VERSION_GROUP_ID) {
+        return state.DoS(100, error("CheckTransaction(): unknown tx version group id"),
+                REJECT_INVALID, "unknown-tx-version-group-id");
+    }
+
+    // Check transaction expiry height is within valid range
+    if (tx.fOverwintered && tx.nVersion == 3 && tx.nExpiryHeight > TX_EXPIRY_HEIGHT_THRESHOLD) {
+        return state.DoS(100, error("CheckTransaction(): expiry height is too high"),
+                         REJECT_INVALID, "overwinter-expiry-height-too-high");
     }
 
     // Transactions can contain empty `vin` and `vout` so long as
@@ -1003,7 +1045,7 @@ bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidatio
             CScript scriptCode;
             uint256 dataToBeSigned;
             try {
-                dataToBeSigned = SignatureHash(scriptCode, tx, NOT_AN_INPUT, SIGHASH_ALL);
+                dataToBeSigned = SignatureHash(scriptCode, tx, NOT_AN_INPUT, SIGHASH_ALL, 0, consensusBranchId);
             } catch (std::logic_error ex) {
                 return state.DoS(100, error("CheckTransaction(): error computing signature hash"),
                                  REJECT_INVALID, "error-computing-signature-hash");
@@ -1074,8 +1116,32 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa
         }
     }
 
+    const Consensus::Params& params = Params().GetConsensus();
+    int currentHeight = chainActive.Height();
+
+    // Has Overwinter upgrade activated?  Gated to avoid assertion in NetworkUpgradeActive when no active chain e.g. testing.
+    bool isOverwinterActive = false;
+    if (currentHeight > 0) {
+        isOverwinterActive = NetworkUpgradeActive(currentHeight, params, Consensus::UPGRADE_OVERWINTER);
+    }
+
+    // Get consensus branch id for the next block, which is what mempool txs want to be mined into.
+    uint32_t consensusBranchId = CurrentEpochBranchId(currentHeight + 1, params);
+
+    // Contextual check: If Overwinter is active, reject transactions which are not Overwintered
+    if (isOverwinterActive && !tx.fOverwintered) {
+        return state.DoS(5, error("AcceptToMemoryPool: pre-overwinter tx not allowed"),
+                         REJECT_INVALID, "tx-not-overwintered");
+    }
+
+    // Contextual check: If Overwinter is not active, reject transactions which are Overwintered
+    if (!isOverwinterActive && tx.fOverwintered) {
+        return state.DoS(5, error("AcceptToMemoryPool: overwinter is not active yet"),
+                         REJECT_INVALID, "tx-overwinter-not-active-yet");
+    }
+
     auto verifier = libzcash::ProofVerifier::Strict();
-    if (!CheckTransaction(tx, state, verifier))
+    if (!CheckTransaction(tx, state, verifier, consensusBranchId))
         return error("AcceptToMemoryPool: CheckTransaction failed");
 
     // Coinbase is only valid in a block, not as a loose transaction
@@ -1085,7 +1151,7 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa
 
     // Rather not work on nonstandard transactions (unless -testnet/-regtest)
     string reason;
-    if (Params().RequireStandard() && !IsStandardTx(tx, reason))
+    if (Params().RequireStandard() && !IsStandardTx(tx, reason, consensusBranchId))
         return state.DoS(0,
                          error("AcceptToMemoryPool: nonstandard transaction: %s", reason),
                          REJECT_NONSTANDARD, reason);
@@ -1168,7 +1234,7 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa
         }
 
         // Check for non-standard pay-to-script-hash in inputs
-        if (Params().RequireStandard() && !AreInputsStandard(tx, view))
+        if (Params().RequireStandard() && !AreInputsStandard(tx, view, consensusBranchId))
             return error("AcceptToMemoryPool: nonstandard transaction input");
 
         // Check that the transaction doesn't have an excessive number of
@@ -1239,7 +1305,8 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa
 
         // Check against previous transactions
         // This is done last to help prevent CPU exhaustion denial-of-service attacks.
-        if (!ContextualCheckInputs(tx, state, view, true, STANDARD_SCRIPT_VERIFY_FLAGS, true, Params().GetConsensus()))
+        PrecomputedTransactionData txdata(tx);
+        if (!ContextualCheckInputs(tx, state, view, true, STANDARD_SCRIPT_VERIFY_FLAGS, true, txdata, Params().GetConsensus(), consensusBranchId))
         {
             return error("AcceptToMemoryPool: ConnectInputs failed %s", hash.ToString());
         }
@@ -1253,7 +1320,7 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa
         // There is a similar check in CreateNewBlock() to prevent creating
         // invalid blocks, however allowing such transactions into the mempool
         // can be exploited as a DoS attack.
-        if (!ContextualCheckInputs(tx, state, view, true, MANDATORY_SCRIPT_VERIFY_FLAGS, true, Params().GetConsensus()))
+        if (!ContextualCheckInputs(tx, state, view, true, MANDATORY_SCRIPT_VERIFY_FLAGS, true, txdata, Params().GetConsensus(), consensusBranchId))
         {
             return error("AcceptToMemoryPool: BUG! PLEASE REPORT THIS! ConnectInputs failed against MANDATORY but not STANDARD flags %s", hash.ToString());
         }
@@ -1576,7 +1643,7 @@ void static InvalidBlockFound(CBlockIndex *pindex, const CValidationState &state
     }
 }
 
-void UpdateCoins(const CTransaction& tx, CValidationState &state, CCoinsViewCache &inputs, CTxUndo &txundo, int nHeight)
+void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txundo, int nHeight)
 {
     // mark inputs spent
     if (!tx.IsCoinBase()) {
@@ -1610,15 +1677,15 @@ void UpdateCoins(const CTransaction& tx, CValidationState &state, CCoinsViewCach
     inputs.ModifyCoins(tx.GetHash())->FromTx(tx, nHeight);
 }
 
-void UpdateCoins(const CTransaction& tx, CValidationState &state, CCoinsViewCache &inputs, int nHeight)
+void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, int nHeight)
 {
     CTxUndo txundo;
-    UpdateCoins(tx, state, inputs, txundo, nHeight);
+    UpdateCoins(tx, inputs, txundo, nHeight);
 }
 
 bool CScriptCheck::operator()() {
     const CScript &scriptSig = ptxTo->vin[nIn].scriptSig;
-    if (!VerifyScript(scriptSig, scriptPubKey, nFlags, CachingTransactionSignatureChecker(ptxTo, nIn, cacheStore), &error)) {
+    if (!VerifyScript(scriptSig, scriptPubKey, nFlags, CachingTransactionSignatureChecker(ptxTo, nIn, amount, cacheStore, *txdata), consensusBranchId, &error)) {
         return ::error("CScriptCheck(): %s:%d VerifySignature failed: %s", ptxTo->GetHash().ToString(), nIn, ScriptErrorString(error));
     }
     return true;
@@ -1701,7 +1768,16 @@ bool CheckTxInputs(const CTransaction& tx, CValidationState& state, const CCoins
 }
 }// namespace Consensus
 
-bool ContextualCheckInputs(const CTransaction& tx, CValidationState &state, const CCoinsViewCache &inputs, bool fScriptChecks, unsigned int flags, bool cacheStore, const Consensus::Params& consensusParams, std::vector<CScriptCheck> *pvChecks)
+bool ContextualCheckInputs(
+    const CTransaction& tx, CValidationState &state,
+    const CCoinsViewCache &inputs,
+    bool fScriptChecks,
+    unsigned int flags,
+    bool cacheStore,
+    PrecomputedTransactionData& txdata,
+    const Consensus::Params& consensusParams,
+    uint32_t consensusBranchId,
+    std::vector<CScriptCheck> *pvChecks)
 {
     if (!tx.IsCoinBase())
     {
@@ -1726,7 +1802,7 @@ bool ContextualCheckInputs(const CTransaction& tx, CValidationState &state, cons
                 assert(coins);
 
                 // Verify signature
-                CScriptCheck check(*coins, tx, i, flags, cacheStore);
+                CScriptCheck check(*coins, tx, i, flags, cacheStore, consensusBranchId, &txdata);
                 if (pvChecks) {
                     pvChecks->push_back(CScriptCheck());
                     check.swap(pvChecks->back());
@@ -1738,9 +1814,9 @@ bool ContextualCheckInputs(const CTransaction& tx, CValidationState &state, cons
                         // arguments; if so, don't trigger DoS protection to
                         // avoid splitting the network between upgraded and
                         // non-upgraded nodes.
-                        CScriptCheck check(*coins, tx, i,
-                                flags & ~STANDARD_NOT_MANDATORY_VERIFY_FLAGS, cacheStore);
-                        if (check())
+                        CScriptCheck check2(*coins, tx, i,
+                                flags & ~STANDARD_NOT_MANDATORY_VERIFY_FLAGS, cacheStore, consensusBranchId, &txdata);
+                        if (check2())
                             return state.Invalid(false, REJECT_NONSTANDARD, strprintf("non-mandatory-script-verify-flag (%s)", ScriptErrorString(check.GetScriptError())));
                     }
                     // Failures of other flags indicate a transaction that is
@@ -2063,8 +2139,11 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
     auto verifier = libzcash::ProofVerifier::Strict();
     auto disabledVerifier = libzcash::ProofVerifier::Disabled();
 
+    // Get the consensus rules to check block against
+    uint32_t consensusBranchId = CurrentEpochBranchId(pindex->nHeight, chainparams.GetConsensus());
+
     // Check it again to verify JoinSplit proofs, and in case a previous version let a bad block in
-    if (!CheckBlock(block, state, fExpensiveChecks ? verifier : disabledVerifier, !fJustCheck, !fJustCheck))
+    if (!CheckBlock(block, state, fExpensiveChecks ? verifier : disabledVerifier, consensusBranchId, !fJustCheck, !fJustCheck))
         return false;
 
     // verify that the view's current state corresponds to the previous block
@@ -2129,6 +2208,8 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         assert(tree.root() == old_tree_root);
     }
 
+    std::vector<PrecomputedTransactionData> txdata;
+    txdata.reserve(block.vtx.size()); // Required so that pointers to individual PrecomputedTransactionData don't get invalidated
     for (unsigned int i = 0; i < block.vtx.size(); i++)
     {
         const CTransaction &tx = block.vtx[i];
@@ -2158,10 +2239,11 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
                 return state.DoS(100, error("ConnectBlock(): too many sigops"),
                                  REJECT_INVALID, "bad-blk-sigops");
 
+            txdata.emplace_back(tx);
             nFees += view.GetValueIn(tx)-tx.GetValueOut();
 
             std::vector<CScriptCheck> vChecks;
-            if (!ContextualCheckInputs(tx, state, view, fExpensiveChecks, flags, false, chainparams.GetConsensus(), nScriptCheckThreads ? &vChecks : NULL))
+            if (!ContextualCheckInputs(tx, state, view, fExpensiveChecks, flags, false, txdata[i], chainparams.GetConsensus(), consensusBranchId, nScriptCheckThreads ? &vChecks : NULL))
                 return false;
             control.Add(vChecks);
         }
@@ -2170,7 +2252,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         if (i > 0) {
             blockundo.vtxundo.push_back(CTxUndo());
         }
-        UpdateCoins(tx, state, view, i == 0 ? undoDummy : blockundo.vtxundo.back(), pindex->nHeight);
+        UpdateCoins(tx, view, i == 0 ? undoDummy : blockundo.vtxundo.back(), pindex->nHeight);
 
         BOOST_FOREACH(const JSDescription &joinsplit, tx.vjoinsplit) {
             BOOST_FOREACH(const uint256 &note_commitment, joinsplit.commitments) {
@@ -2423,7 +2505,6 @@ void static UpdateTip(CBlockIndex *pindexNew) {
 bool static DisconnectTip(CValidationState &state, bool fBare = false) {
     CBlockIndex *pindexDelete = chainActive.Tip();
     assert(pindexDelete);
-    mempool.check(pcoinsTip);
     // Read block from disk.
     CBlock block;
     if (!ReadBlockFromDisk(block, pindexDelete))
@@ -2458,7 +2539,6 @@ bool static DisconnectTip(CValidationState &state, bool fBare = false) {
             mempool.removeWithAnchor(anchorBeforeDisconnect);
         }
         mempool.removeCoinbaseSpends(pcoinsTip, pindexDelete->nHeight);
-        mempool.check(pcoinsTip);
     }
 
     // Update chainActive and related variables.
@@ -2488,7 +2568,6 @@ static int64_t nTimePostConnect = 0;
  */
 bool static ConnectTip(CValidationState &state, CBlockIndex *pindexNew, CBlock *pblock) {
     assert(pindexNew->pprev == chainActive.Tip());
-    mempool.check(pcoinsTip);
     // Read block from disk.
     int64_t nTime1 = GetTimeMicros();
     CBlock block;
@@ -2528,7 +2607,6 @@ bool static ConnectTip(CValidationState &state, CBlockIndex *pindexNew, CBlock *
     // Remove conflicting transactions from the mempool.
     list<CTransaction> txConflicted;
     mempool.removeForBlock(pblock->vtx, pindexNew->nHeight, txConflicted, !IsInitialBlockDownload());
-    mempool.check(pcoinsTip);
     // Update chainActive & related variables.
     UpdateTip(pindexNew);
     // Tell wallet about transactions that went from mempool
@@ -2679,6 +2757,7 @@ static bool ActivateBestChainStep(CValidationState &state, CBlockIndex *pindexMo
         }
     }
     }
+    mempool.check(pcoinsTip);
 
     // Callbacks/notifications for a new best chain.
     if (fInvalidFound)
@@ -3028,6 +3107,7 @@ bool CheckBlockHeader(const CBlockHeader& block, CValidationState& state, bool f
 
 bool CheckBlock(const CBlock& block, CValidationState& state,
                 libzcash::ProofVerifier& verifier,
+                uint32_t consensusBranchId,
                 bool fCheckPOW, bool fCheckMerkleRoot)
 {
     // These are checks that are independent of context.
@@ -3073,7 +3153,7 @@ bool CheckBlock(const CBlock& block, CValidationState& state,
 
     // Check transactions
     BOOST_FOREACH(const CTransaction& tx, block.vtx)
-        if (!CheckTransaction(tx, state, verifier))
+        if (!CheckTransaction(tx, state, verifier, consensusBranchId))
             return error("CheckBlock(): CheckTransaction failed");
 
     unsigned int nSigOps = 0;
@@ -3130,6 +3210,19 @@ bool ContextualCheckBlock(const CBlock& block, CValidationState& state, CBlockIn
 {
     const int nHeight = pindexPrev == NULL ? 0 : pindexPrev->nHeight + 1;
     const Consensus::Params& consensusParams = Params().GetConsensus();
+
+    // Check that all transactions have the Overwinter flag set appropriately.
+    bool isOverwinterActive = NetworkUpgradeActive(nHeight, consensusParams, Consensus::UPGRADE_OVERWINTER);
+    BOOST_FOREACH(const CTransaction& tx, block.vtx) {
+        if (isOverwinterActive && !tx.fOverwintered) {
+            return state.DoS(100, error("%s: contains pre-overwinter tx", __func__),
+                            REJECT_INVALID, "cb-no-pre-overwinter-tx-when-active");
+        }
+        if (!isOverwinterActive && tx.fOverwintered) {
+            return state.DoS(100, error("%s: contains overwinter tx", __func__),
+                            REJECT_INVALID, "cb-no-overwinter-tx-when-inactive");
+        }
+    }
 
     // Check that all transactions are finalized
     BOOST_FOREACH(const CTransaction& tx, block.vtx) {
@@ -3255,9 +3348,12 @@ bool AcceptBlock(CBlock& block, CValidationState& state, CBlockIndex** ppindex, 
         if (fTooFarAhead) return true;      // Block height is too high
     }
 
+    // Get branch id of the set of consensus rules to use when checking block
+    uint32_t consensusBranchId = CurrentEpochBranchId(pindex->nHeight, chainparams.GetConsensus());
+
     // See method docstring for why this is always disabled
     auto verifier = libzcash::ProofVerifier::Disabled();
-    if ((!CheckBlock(block, state, verifier)) || !ContextualCheckBlock(block, state, pindex->pprev)) {
+    if ((!CheckBlock(block, state, verifier, consensusBranchId)) || !ContextualCheckBlock(block, state, pindex->pprev)) {
         if (state.IsInvalid() && !state.CorruptionPossible()) {
             pindex->nStatus |= BLOCK_FAILED_VALID;
             setDirtyBlockIndex.insert(pindex);
@@ -3305,9 +3401,17 @@ static bool IsSuperMajority(int minVersion, const CBlockIndex* pstart, unsigned 
 
 bool ProcessNewBlock(CValidationState &state, CNode* pfrom, CBlock* pblock, bool fForceProcessing, CDiskBlockPos *dbp)
 {
+    int height = 0;
+    {
+        LOCK(cs_main);
+        // FIXME: IS THIS THE RIGHT HEIGHT TO USE?
+        height = chainActive.Height() + 1;
+    }
+    uint32_t consensusBranchId = CurrentEpochBranchId(height, Params().GetConsensus());
+
     // Preliminary checks
     auto verifier = libzcash::ProofVerifier::Disabled();
-    bool checked = CheckBlock(*pblock, state, verifier);
+    bool checked = CheckBlock(*pblock, state, verifier, consensusBranchId);
 
     {
         LOCK(cs_main);
@@ -3345,11 +3449,13 @@ bool TestBlockValidity(CValidationState &state, const CBlock& block, CBlockIndex
     indexDummy.nHeight = pindexPrev->nHeight + 1;
     // JoinSplit proofs are verified in ConnectBlock
     auto verifier = libzcash::ProofVerifier::Disabled();
+    // Get branch id for the consensus rules a new block at current tip +1 should be checked against.
+    uint32_t consensusBranchId = CurrentEpochBranchId(indexDummy.nHeight, Params().GetConsensus());
 
     // NOTE: CheckBlockHeader is called by CheckBlock
     if (!ContextualCheckBlockHeader(block, state, pindexPrev))
         return false;
-    if (!CheckBlock(block, state, verifier, fCheckPOW, fCheckMerkleRoot))
+    if (!CheckBlock(block, state, verifier, consensusBranchId, fCheckPOW, fCheckMerkleRoot))
         return false;
     if (!ContextualCheckBlock(block, state, pindexPrev))
         return false;
@@ -3721,7 +3827,9 @@ bool CVerifyDB::VerifyDB(CCoinsView *coinsview, int nCheckLevel, int nCheckDepth
         if (!ReadBlockFromDisk(block, pindex))
             return error("VerifyDB(): *** ReadBlockFromDisk failed at %d, hash=%s", pindex->nHeight, pindex->GetBlockHash().ToString());
         // check level 1: verify block validity
-        if (nCheckLevel >= 1 && !CheckBlock(block, state, verifier))
+        // Use the consensus rules valid at the block height
+        uint32_t consensusBranchId = CurrentEpochBranchId(pindex->nHeight, Params().GetConsensus());
+        if (nCheckLevel >= 1 && !CheckBlock(block, state, verifier, consensusBranchId))
             return error("VerifyDB(): *** found bad block at %d, hash=%s\n", pindex->nHeight, pindex->GetBlockHash().ToString());
         // check level 2: verify undo validity
         if (nCheckLevel >= 2 && pindex) {
